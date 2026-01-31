@@ -393,7 +393,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         
         # 2. Fetch Water Features
         pbar.set_description("Downloading water features")
-        water = fetch_features(point, compensated_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
+        water = fetch_features(point, compensated_dist, tags={'natural': ['water', 'bay'], 'waterway': 'riverbank'}, name='water')
         pbar.update(1)
         
         # 3. Fetch Parks
