@@ -378,7 +378,7 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None):
     print(f"\nGenerating map for {city}, {country}...")
     
     # Progress bar for data fetching
@@ -529,8 +529,14 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         font_attr = FontProperties(family='monospace', size=8)
     
     ax.text(0.98, 0.02, "© OpenStreetMap contributors", transform=ax.transAxes,
-            color=THEME['text'], alpha=0.5, ha='right', va='bottom', 
+            color=THEME['text'], alpha=0.5, ha='right', va='bottom',
             fontproperties=font_attr, zorder=11)
+
+    # --- BRAND (bottom left) ---
+    if brand:
+        ax.text(0.02, 0.02, brand, transform=ax.transAxes,
+                color=THEME['text'], alpha=0.5, ha='left', va='bottom',
+                fontproperties=font_attr, zorder=11)
 
     # 5. Save
     print(f"Saving to {output_file}...")
@@ -657,6 +663,7 @@ Examples:
     parser.add_argument('--dpi', type=int, default=300, help='DPI for PNG output (default: 300)')
     parser.add_argument('--lat', type=float, help='Latitude (use with --lon to skip geocoding)')
     parser.add_argument('--lon', type=float, help='Longitude (use with --lat to skip geocoding)')
+    parser.add_argument('--brand', type=str, help='Brand text to display in bottom left corner')
 
     args = parser.parse_args()
     
@@ -716,7 +723,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
