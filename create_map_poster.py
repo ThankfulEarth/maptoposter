@@ -378,12 +378,14 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None):
     print(f"\nGenerating map for {city}, {country}...")
 
     # Calculate total steps for progress bar
     total_steps = 3  # street network, water, parks
     if coastline:
+        total_steps += 1
+    if borders_level is not None:
         total_steps += 1
 
     # Progress bar for data fetching
@@ -411,6 +413,13 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if coastline:
             pbar.set_description("Downloading coastlines")
             coastlines_data = fetch_features(point, compensated_dist, tags={'natural': 'coastline'}, name='coastlines')
+            pbar.update(1)
+
+        # 5. Fetch Borders (optional)
+        borders_data = None
+        if borders_level is not None:
+            pbar.set_description(f"Downloading admin borders (level {borders_level})")
+            borders_data = fetch_features(point, compensated_dist, tags={'boundary': 'administrative', 'admin_level': str(borders_level)}, name=f'borders_L{borders_level}')
             pbar.update(1)
 
     print("✓ All data retrieved successfully!")
@@ -458,6 +467,17 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
                 coastline_lines = coastline_lines.to_crs(G_proj.graph['crs'])
             coastline_color = THEME.get('coastline', THEME['text'])
             coastline_lines.plot(ax=ax, edgecolor=coastline_color, linewidth=0.8, zorder=3)
+
+    # Layer 1c: Administrative borders (optional)
+    if borders_data is not None and not borders_data.empty:
+        border_lines = borders_data[borders_data.geometry.type.isin(['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon'])]
+        if not border_lines.empty:
+            try:
+                border_lines = ox.projection.project_gdf(border_lines)
+            except Exception:
+                border_lines = border_lines.to_crs(G_proj.graph['crs'])
+            border_color = THEME.get('borders', THEME['text'])
+            border_lines.plot(ax=ax, facecolor='none', edgecolor=border_color, linewidth=0.6, linestyle='--', zorder=3)
 
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
@@ -688,6 +708,7 @@ Examples:
     parser.add_argument('--lon', type=float, help='Longitude (use with --lat to skip geocoding)')
     parser.add_argument('--brand', type=str, help='Brand text to display in bottom left corner')
     parser.add_argument('--coastline', action='store_true', help='Show coastlines')
+    parser.add_argument('--borders', type=int, metavar='LEVEL', help='Show administrative borders (2=country, 4=state/region, 6=county)')
 
     args = parser.parse_args()
     
@@ -747,7 +768,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
