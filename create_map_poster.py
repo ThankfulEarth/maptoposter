@@ -655,6 +655,8 @@ Examples:
     parser.add_argument('--list-themes', action='store_true', help='List all available themes')
     parser.add_argument('--format', '-f', default='png', choices=['png', 'svg', 'pdf'],help='Output format for the poster (default: png)')
     parser.add_argument('--dpi', type=int, default=300, help='DPI for PNG output (default: 300)')
+    parser.add_argument('--lat', type=float, help='Latitude (use with --lon to skip geocoding)')
+    parser.add_argument('--lon', type=float, help='Longitude (use with --lat to skip geocoding)')
 
     args = parser.parse_args()
     
@@ -667,10 +669,20 @@ Examples:
     if args.list_themes:
         list_themes()
         sys.exit(0)
-    
+
+    # Validate lat/lon: if one is provided, both must be provided
+    if (args.lat is None) != (args.lon is None):
+        print("Error: --lat and --lon must be used together.\n")
+        sys.exit(1)
+
     # Validate required arguments
-    if not args.city or not args.country:
-        print("Error: --city and --country are required.\n")
+    has_coordinates = args.lat is not None and args.lon is not None
+    if not args.city:
+        print("Error: --city is required.\n")
+        print_examples()
+        sys.exit(1)
+    if not has_coordinates and not args.country:
+        print("Error: --country is required (unless using --lat/--lon).\n")
         print_examples()
         sys.exit(1)
     
@@ -694,11 +706,17 @@ Examples:
     
     # Get coordinates and generate poster
     try:
-        coords = get_coordinates(args.city, args.country)
+        if args.lat is not None and args.lon is not None:
+            coords = (args.lat, args.lon)
+            print(f"Using provided coordinates: {args.lat}, {args.lon}")
+        else:
+            coords = get_coordinates(args.city, args.country)
+
+        country_for_poster = args.country if args.country else ""
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, args.country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
