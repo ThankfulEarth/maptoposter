@@ -378,7 +378,7 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False):
     print(f"\nGenerating map for {city}, {country}...")
 
     # Calculate total steps for progress bar
@@ -386,6 +386,8 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     if coastline:
         total_steps += 1
     if borders_level is not None:
+        total_steps += 1
+    if glaciers:
         total_steps += 1
 
     # Progress bar for data fetching
@@ -422,6 +424,13 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             borders_data = fetch_features(point, compensated_dist, tags={'boundary': 'administrative', 'admin_level': str(borders_level)}, name=f'borders_L{borders_level}')
             pbar.update(1)
 
+        # 6. Fetch Glaciers (optional)
+        glaciers_data = None
+        if glaciers:
+            pbar.set_description("Downloading glaciers")
+            glaciers_data = fetch_features(point, compensated_dist, tags={'natural': 'glacier'}, name='glaciers')
+            pbar.update(1)
+
     print("✓ All data retrieved successfully!")
     
     # 2. Setup Plot
@@ -456,6 +465,17 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             except Exception:
                 parks_polys = parks_polys.to_crs(G_proj.graph['crs'])
             parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
+
+    # Layer 1a: Glaciers (optional)
+    if glaciers_data is not None and not glaciers_data.empty:
+        glaciers_polys = glaciers_data[glaciers_data.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+        if not glaciers_polys.empty:
+            try:
+                glaciers_polys = ox.projection.project_gdf(glaciers_polys)
+            except Exception:
+                glaciers_polys = glaciers_polys.to_crs(G_proj.graph['crs'])
+            glacier_color = THEME.get('glaciers', '#CEEAEE')
+            glaciers_polys.plot(ax=ax, facecolor=glacier_color, edgecolor='none', zorder=0)
 
     # Layer 1b: Coastlines (optional)
     if coastlines_data is not None and not coastlines_data.empty:
@@ -709,6 +729,7 @@ Examples:
     parser.add_argument('--brand', type=str, help='Brand text to display in bottom left corner')
     parser.add_argument('--coastline', action='store_true', help='Show coastlines')
     parser.add_argument('--borders', type=int, metavar='LEVEL', help='Show administrative borders (2=country, 4=state/region, 6=county)')
+    parser.add_argument('--glaciers', action='store_true', help='Show glaciers/ice sheets')
 
     args = parser.parse_args()
     
@@ -768,7 +789,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
