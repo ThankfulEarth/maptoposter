@@ -378,7 +378,7 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300):
     print(f"\nGenerating map for {city}, {country}...")
     
     # Progress bar for data fetching
@@ -540,7 +540,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
 
     # DPI matters mainly for raster formats
     if fmt == "png":
-        save_kwargs["dpi"] = 300
+        save_kwargs["dpi"] = dpi
 
     plt.savefig(output_file, format=fmt, **save_kwargs)
 
@@ -654,7 +654,8 @@ Examples:
     parser.add_argument('--height', '-H', type=float, default=16, help='Image height in inches (default: 16)')
     parser.add_argument('--list-themes', action='store_true', help='List all available themes')
     parser.add_argument('--format', '-f', default='png', choices=['png', 'svg', 'pdf'],help='Output format for the poster (default: png)')
-    
+    parser.add_argument('--dpi', type=int, default=300, help='DPI for PNG output (default: 300)')
+
     args = parser.parse_args()
     
     # If no arguments provided, show examples
@@ -697,7 +698,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, args.country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label)
+            create_poster(args.city, args.country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
