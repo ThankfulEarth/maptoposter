@@ -378,11 +378,16 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False):
     print(f"\nGenerating map for {city}, {country}...")
-    
+
+    # Calculate total steps for progress bar
+    total_steps = 3  # street network, water, parks
+    if coastline:
+        total_steps += 1
+
     # Progress bar for data fetching
-    with tqdm(total=3, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+    with tqdm(total=total_steps, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
         compensated_dist = dist * (max(height, width) / min(height, width))/4 # To compensate for viewport crop
@@ -400,7 +405,14 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         pbar.set_description("Downloading parks/green spaces")
         parks = fetch_features(point, compensated_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
         pbar.update(1)
-    
+
+        # 4. Fetch Coastlines (optional)
+        coastlines_data = None
+        if coastline:
+            pbar.set_description("Downloading coastlines")
+            coastlines_data = fetch_features(point, compensated_dist, tags={'natural': 'coastline'}, name='coastlines')
+            pbar.update(1)
+
     print("✓ All data retrieved successfully!")
     
     # 2. Setup Plot
@@ -435,7 +447,18 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             except Exception:
                 parks_polys = parks_polys.to_crs(G_proj.graph['crs'])
             parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
-    
+
+    # Layer 1b: Coastlines (optional)
+    if coastlines_data is not None and not coastlines_data.empty:
+        coastline_lines = coastlines_data[coastlines_data.geometry.type.isin(['LineString', 'MultiLineString'])]
+        if not coastline_lines.empty:
+            try:
+                coastline_lines = ox.projection.project_gdf(coastline_lines)
+            except Exception:
+                coastline_lines = coastline_lines.to_crs(G_proj.graph['crs'])
+            coastline_color = THEME.get('coastline', THEME['text'])
+            coastline_lines.plot(ax=ax, edgecolor=coastline_color, linewidth=0.8, zorder=3)
+
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
     edge_colors = get_edge_colors_by_type(G_proj)
@@ -664,6 +687,7 @@ Examples:
     parser.add_argument('--lat', type=float, help='Latitude (use with --lon to skip geocoding)')
     parser.add_argument('--lon', type=float, help='Longitude (use with --lat to skip geocoding)')
     parser.add_argument('--brand', type=str, help='Brand text to display in bottom left corner')
+    parser.add_argument('--coastline', action='store_true', help='Show coastlines')
 
     args = parser.parse_args()
     
@@ -723,7 +747,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
