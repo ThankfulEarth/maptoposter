@@ -22,6 +22,60 @@ from geopandas import GeoDataFrame
 import pickle
 from shapely.geometry import Point
 
+# Offline OSM mode configuration
+# NOTE: OSM_PLANET must point to a full planet/regional PBF with ALL features (roads, water, parks, etc.)
+# Do NOT use filtered extracts (e.g., boundaries-only) as they will be missing required map data.
+USE_OFFLINE_OSM = os.environ.get("OSM_OFFLINE", "false").lower() == "true"
+OSM_PLANET_PATH = Path(os.environ.get("OSM_PLANET", "/app/osm/planet-latest.osm.pbf"))
+OSM_EXTRACT_CACHE_DIR = Path(os.environ.get("OSM_EXTRACT_CACHE", "/app/osm/extracts"))
+
+# Lazy-loaded offline reader (only initialized if USE_OFFLINE_OSM is True)
+_offline_reader = None
+
+
+def _get_offline_reader():
+    """Get or create the offline OSM reader singleton."""
+    global _offline_reader
+    if _offline_reader is None:
+        from osm_cache import OsmExtractCache
+        from osm_reader import OsmOfflineReader
+
+        cache = OsmExtractCache(OSM_PLANET_PATH, OSM_EXTRACT_CACHE_DIR)
+        _offline_reader = OsmOfflineReader(cache)
+    return _offline_reader
+
+
+def point_dist_to_bbox(
+    point: tuple[float, float], dist: float
+) -> tuple[float, float, float, float]:
+    """
+    Convert a center point and distance to a bounding box.
+
+    Uses approximate conversion: 1 degree latitude ~ 111km.
+    Longitude varies with latitude.
+
+    Args:
+        point: (latitude, longitude) tuple
+        dist: Distance in meters from center to edge
+
+    Returns:
+        (west, south, east, north) bbox in degrees
+    """
+    lat, lon = point
+    # Approximate degrees per meter
+    lat_deg_per_m = 1 / 111000
+    lon_deg_per_m = 1 / (111000 * abs(np.cos(np.radians(lat))))
+
+    lat_delta = dist * lat_deg_per_m
+    lon_delta = dist * lon_deg_per_m
+
+    return (
+        lon - lon_delta,  # west
+        lat - lat_delta,  # south
+        lon + lon_delta,  # east
+        lat + lat_delta,  # north
+    )
+
 class CacheError(Exception):
     """Raised when a cache operation fails."""
     pass
@@ -334,6 +388,12 @@ def get_crop_limits(G_proj, center_lat_lon, fig, dist):
 
 
 def fetch_graph(point, dist) -> MultiDiGraph | None:
+    """
+    Fetch street network graph for a point and distance.
+
+    In offline mode, this still uses OSMnx but could be extended to use
+    offline data. For now, graphs require OSMnx due to network topology.
+    """
     lat, lon = point
     graph = f"graph_{lat}_{lon}_{dist}"
     cached = cache_get(graph)
@@ -341,6 +401,8 @@ def fetch_graph(point, dist) -> MultiDiGraph | None:
         print("✓ Using cached street network")
         return cast(MultiDiGraph, cached)
 
+    # Note: Even in offline mode, we use OSMnx for graphs because it handles
+    # network topology construction. The features (water, parks) use offline mode.
     try:
         G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all', truncate_by_edge=True)
         # Rate limit between requests
@@ -355,25 +417,43 @@ def fetch_graph(point, dist) -> MultiDiGraph | None:
         return None
 
 def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
+    """
+    Fetch OSM features for a point and distance.
+
+    In offline mode, uses local PBF extracts instead of Overpass API.
+    """
     lat, lon = point
     tag_str = "_".join(tags.keys())
     features = f"{name}_{lat}_{lon}_{dist}_{tag_str}"
+
+    # Check local pickle cache first (works for both modes)
     cached = cache_get(features)
     if cached is not None:
         print(f"✓ Using cached {name}")
         return cast(GeoDataFrame, cached)
 
     try:
-        data = ox.features_from_point(point, tags=tags, dist=dist)
-        # Rate limit between requests
-        time.sleep(0.3)
+        if USE_OFFLINE_OSM:
+            # Offline mode: use local PBF extracts
+            reader = _get_offline_reader()
+            bbox = point_dist_to_bbox(point, dist)
+            data = reader.get_features(bbox, tags, clip_to_bbox=True)
+            print(f"✓ Loaded {name} from offline OSM (bbox extract)")
+        else:
+            # Online mode: use OSMnx/Overpass API
+            data = ox.features_from_point(point, tags=tags, dist=dist)
+            # Rate limit between requests
+            time.sleep(0.3)
+
+        # Cache the result (pickle cache for fast subsequent loads)
         try:
             cache_set(features, data)
         except CacheError as e:
             print(e)
         return data
     except Exception as e:
-        print(f"OSMnx error while fetching features: {e}")
+        mode = "offline" if USE_OFFLINE_OSM else "OSMnx"
+        print(f"{mode} error while fetching features: {e}")
         return None
 
 
