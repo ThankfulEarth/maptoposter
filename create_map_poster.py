@@ -19,8 +19,10 @@ from pathlib import Path
 from hashlib import md5
 from typing import cast
 from geopandas import GeoDataFrame
+import geopandas as gpd
 import pickle
-from shapely.geometry import Point
+import math
+from shapely.geometry import Point, box
 
 # Offline OSM mode configuration
 # NOTE: OSM_PLANET must point to a full planet/regional PBF with ALL features (roads, water, parks, etc.)
@@ -28,6 +30,58 @@ from shapely.geometry import Point
 USE_OFFLINE_OSM = os.environ.get("OSM_OFFLINE", "false").lower() == "true"
 OSM_PLANET_PATH = Path(os.environ.get("OSM_PLANET", "/app/osm/planet-latest.osm.pbf"))
 OSM_EXTRACT_CACHE_DIR = Path(os.environ.get("OSM_EXTRACT_CACHE", "/app/osm/extracts"))
+
+# Land polygons for land/water distinction
+# Full resolution > simplified > Natural Earth 10m > none
+_LAND_FULL = Path(__file__).parent / "data" / "osm_land" / "land-polygons-complete-3857" / "land_polygons.shp"
+_LAND_SIMPLIFIED = Path(__file__).parent / "data" / "osm_land" / "simplified-land-polygons-complete-3857" / "simplified_land_polygons.shp"
+_LAND_NE = Path(__file__).parent / "data" / "natural_earth" / "ne_10m_land.shp"
+_land_gdf = None
+_land_source = None
+_land_loaded = False
+
+
+def _get_land_polygons(clip_bbox=None):
+    """Load land polygons with bbox-based reading for large datasets.
+
+    For the full-resolution dataset (~800MB), uses gpd.read_file(bbox=...)
+    to only load polygons intersecting the clip area. Result is NOT cached
+    since each poster has a different bbox.
+
+    For smaller datasets (simplified, Natural Earth), loads everything once
+    and caches globally.
+    """
+    global _land_gdf, _land_source, _land_loaded
+
+    # Full-resolution: always read with bbox filter (too large to load entirely)
+    # The shapefile is EPSG:3857 so we must reproject the WGS84 bbox
+    if _LAND_FULL.exists():
+        if clip_bbox is not None:
+            from pyproj import Transformer
+            west, south, east, north = clip_bbox
+            transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+            x_min, y_min = transformer.transform(west, south)
+            x_max, y_max = transformer.transform(east, north)
+            gdf = gpd.read_file(_LAND_FULL, bbox=(x_min, y_min, x_max, y_max))
+            if gdf.crs and gdf.crs.to_epsg() != 4326:
+                gdf = gdf.to_crs("EPSG:4326")
+            return gdf
+        # No clip_bbox — fall through to simplified/NE
+
+    # Simplified or Natural Earth: load once, cache globally
+    if _land_loaded:
+        return _land_gdf
+    _land_loaded = True
+    for path in (_LAND_SIMPLIFIED, _LAND_NE):
+        if path.exists():
+            gdf = gpd.read_file(path)
+            if gdf.crs and gdf.crs.to_epsg() != 4326:
+                gdf = gdf.to_crs("EPSG:4326")
+            _land_gdf = gdf
+            _land_source = str(path)
+            return _land_gdf
+    return None
+
 
 # Lazy-loaded offline reader (only initialized if USE_OFFLINE_OSM is True)
 _offline_reader = None
@@ -301,6 +355,45 @@ def get_edge_widths_by_type(G):
     
     return edge_widths
 
+def classify_highway(highway):
+    """Normalize highway value (can be a list or string) to a single string."""
+    if isinstance(highway, list):
+        highway = highway[0] if highway else 'unclassified'
+    if not isinstance(highway, str):
+        return 'unclassified'
+    return highway
+
+
+def get_road_color(highway):
+    """Get theme color for a highway type."""
+    highway = classify_highway(highway)
+    if highway in ('motorway', 'motorway_link'):
+        return THEME['road_motorway']
+    if highway in ('trunk', 'trunk_link', 'primary', 'primary_link'):
+        return THEME['road_primary']
+    if highway in ('secondary', 'secondary_link'):
+        return THEME['road_secondary']
+    if highway in ('tertiary', 'tertiary_link'):
+        return THEME['road_tertiary']
+    if highway in ('residential', 'living_street', 'unclassified'):
+        return THEME['road_residential']
+    return THEME['road_default']
+
+
+def get_road_width(highway):
+    """Get line width for a highway type."""
+    highway = classify_highway(highway)
+    if highway in ('motorway', 'motorway_link'):
+        return 1.2
+    if highway in ('trunk', 'trunk_link', 'primary', 'primary_link'):
+        return 1.0
+    if highway in ('secondary', 'secondary_link'):
+        return 0.8
+    if highway in ('tertiary', 'tertiary_link'):
+        return 0.6
+    return 0.4
+
+
 def get_coordinates(city, country):
     """
     Fetches coordinates for a given city and country using geopy.
@@ -351,19 +444,26 @@ def get_coordinates(city, country):
     else:
         raise ValueError(f"Could not find coordinates for {city}, {country}")
     
-def get_crop_limits(G_proj, center_lat_lon, fig, dist):
+def get_crop_limits(crs, center_lat_lon, fig, dist, bbox=None):
     """
     Crop inward to preserve aspect ratio while guaranteeing
-    full coverage of the requested radius.
+    full coverage of the requested area.
+
+    Args:
+        crs: The target CRS (from graph or UTM zone)
+        center_lat_lon: (lat, lon) tuple
+        fig: matplotlib Figure
+        dist: distance in meters (used when bbox is None)
+        bbox: optional (west, south, east, north) in WGS84
     """
     lat, lon = center_lat_lon
 
-    # Project center point into graph CRS
+    # Project center point into target CRS
     center = (
         ox.projection.project_geometry(
             Point(lon, lat),
             crs="EPSG:4326",
-            to_crs=G_proj.graph["crs"]
+            to_crs=crs
         )[0]
     )
     center_x, center_y = center.x, center.y
@@ -371,15 +471,33 @@ def get_crop_limits(G_proj, center_lat_lon, fig, dist):
     fig_width, fig_height = fig.get_size_inches()
     aspect = fig_width / fig_height
 
-    # Start from the *requested* radius
-    half_x = dist
-    half_y = dist
+    if bbox is not None:
+        west, south, east, north = bbox
+        # Project bbox corners into target CRS to get metric extents
+        sw = ox.projection.project_geometry(
+            Point(west, south), crs="EPSG:4326", to_crs=crs
+        )[0]
+        ne = ox.projection.project_geometry(
+            Point(east, north), crs="EPSG:4326", to_crs=crs
+        )[0]
+        half_x = max(abs(ne.x - center_x), abs(center_x - sw.x))
+        half_y = max(abs(ne.y - center_y), abs(center_y - sw.y))
 
-    # Cut inward to match aspect
-    if aspect > 1:  # landscape → reduce height
-        half_y = half_x / aspect
-    else:           # portrait → reduce width
-        half_x = half_y * aspect
+        # Expand the smaller axis so the full bbox fits within the poster
+        if half_x / half_y > aspect:
+            half_y = half_x / aspect
+        else:
+            half_x = half_y * aspect
+    else:
+        # Start from the *requested* radius
+        half_x = dist
+        half_y = dist
+
+        # Cut inward to match aspect
+        if aspect > 1:  # landscape → reduce height
+            half_y = half_x / aspect
+        else:           # portrait → reduce width
+            half_x = half_y * aspect
 
     return (
         (center_x - half_x, center_x + half_x),
@@ -387,24 +505,107 @@ def get_crop_limits(G_proj, center_lat_lon, fig, dist):
     )
 
 
-def fetch_graph(point, dist) -> MultiDiGraph | None:
-    """
-    Fetch street network graph for a point and distance.
+ROAD_DETAIL_LEVELS = {
+    "low": [
+        'motorway', 'motorway_link', 'trunk', 'trunk_link', 'primary', 'primary_link',
+    ],
+    "medium": [
+        'motorway', 'motorway_link', 'trunk', 'trunk_link',
+        'primary', 'primary_link', 'secondary', 'secondary_link', 'tertiary', 'tertiary_link',
+    ],
+    "high": [
+        'motorway', 'motorway_link', 'trunk', 'trunk_link',
+        'primary', 'primary_link', 'secondary', 'secondary_link',
+        'tertiary', 'tertiary_link', 'residential', 'living_street', 'unclassified', 'service',
+    ],
+}
 
-    In offline mode, this still uses OSMnx but could be extended to use
-    offline data. For now, graphs require OSMnx due to network topology.
+
+def resolve_road_detail(road_detail: str, bbox=None) -> str:
+    """Auto-detect road detail level from bbox area when set to 'auto'."""
+    if road_detail != "auto":
+        return road_detail
+    if bbox is None:
+        return "high"
+    west, south, east, north = bbox
+    # Approximate area in km² using lat/lon deltas
+    lat_mid = (south + north) / 2
+    width_km = (east - west) * 111 * math.cos(math.radians(lat_mid))
+    height_km = (north - south) * 111
+    area_km2 = width_km * height_km
+    if area_km2 > 500_000:
+        level = "low"
+    elif area_km2 > 500:
+        level = "medium"
+    else:
+        level = "high"
+    print(f"  Road detail: {level} (bbox area ≈ {area_km2:,.0f} km²)")
+    return level
+
+
+def fetch_roads_offline(bbox, road_detail: str = "high") -> GeoDataFrame | None:
     """
-    lat, lon = point
-    graph = f"graph_{lat}_{lon}_{dist}"
+    Fetch road geometries from offline PBF extracts.
+
+    Returns a GeoDataFrame with highway LineStrings instead of an OSMnx graph.
+    Uses road_detail level to filter highway types (low/medium/high).
+    """
+    west, south, east, north = bbox
+    cache_key = f"roads_offline_{road_detail}_bbox_{north}_{south}_{east}_{west}"
+
+    cached = cache_get(cache_key)
+    if cached is not None:
+        print("✓ Using cached offline roads")
+        return cast(GeoDataFrame, cached)
+
+    highway_types = ROAD_DETAIL_LEVELS.get(road_detail, ROAD_DETAIL_LEVELS["high"])
+
+    try:
+        reader = _get_offline_reader()
+        roads = reader.get_features(bbox, tags={"highway": highway_types}, clip_to_bbox=True)
+        if roads is None or roads.empty:
+            print("⚠ No roads found in offline PBF for this bbox")
+            return None
+
+        # Filter to LineString/MultiLineString geometries only
+        roads = roads[roads.geometry.type.isin(['LineString', 'MultiLineString'])]
+
+        print(f"✓ Loaded {len(roads)} roads from offline OSM ({road_detail} detail)")
+        try:
+            cache_set(cache_key, roads)
+        except CacheError as e:
+            print(e)
+        return roads
+    except Exception as e:
+        print(f"Offline OSM error while fetching roads: {e}")
+        return None
+
+
+def fetch_graph(point, dist, bbox=None) -> MultiDiGraph | None:
+    """
+    Fetch street network graph for a point+distance or bbox.
+
+    In online mode, uses OSMnx/Overpass API.
+    In offline mode with bbox, use fetch_roads_offline() instead (called from create_poster).
+    """
+    if bbox is not None:
+        west, south, east, north = bbox
+        graph = f"graph_bbox_{north}_{south}_{east}_{west}"
+    else:
+        lat, lon = point
+        graph = f"graph_{lat}_{lon}_{dist}"
+
     cached = cache_get(graph)
     if cached is not None:
         print("✓ Using cached street network")
         return cast(MultiDiGraph, cached)
 
-    # Note: Even in offline mode, we use OSMnx for graphs because it handles
-    # network topology construction. The features (water, parks) use offline mode.
     try:
-        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all', truncate_by_edge=True)
+        if bbox is not None:
+            west, south, east, north = bbox
+            G = ox.graph_from_bbox(bbox=(north, south, east, west), network_type='all', truncate_by_edge=True)
+        else:
+            G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all', truncate_by_edge=True)
         # Rate limit between requests
         time.sleep(0.5)
         try:
@@ -416,15 +617,20 @@ def fetch_graph(point, dist) -> MultiDiGraph | None:
         print(f"OSMnx error while fetching graph: {e}")
         return None
 
-def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
+def fetch_features(point, dist, tags, name, bbox=None) -> GeoDataFrame | None:
     """
-    Fetch OSM features for a point and distance.
+    Fetch OSM features for a point+distance or bbox.
 
     In offline mode, uses local PBF extracts instead of Overpass API.
     """
-    lat, lon = point
-    tag_str = "_".join(tags.keys())
-    features = f"{name}_{lat}_{lon}_{dist}_{tag_str}"
+    if bbox is not None:
+        west, south, east, north = bbox
+        tag_str = "_".join(tags.keys())
+        features = f"{name}_bbox_{north}_{south}_{east}_{west}_{tag_str}"
+    else:
+        lat, lon = point
+        tag_str = "_".join(tags.keys())
+        features = f"{name}_{lat}_{lon}_{dist}_{tag_str}"
 
     # Check local pickle cache first (works for both modes)
     cached = cache_get(features)
@@ -433,11 +639,20 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
         return cast(GeoDataFrame, cached)
 
     try:
-        if USE_OFFLINE_OSM:
+        if bbox is not None:
+            if USE_OFFLINE_OSM:
+                reader = _get_offline_reader()
+                data = reader.get_features(bbox, tags, clip_to_bbox=True)
+                print(f"✓ Loaded {name} from offline OSM (bbox extract)")
+            else:
+                west, south, east, north = bbox
+                data = ox.features_from_bbox(bbox=(north, south, east, west), tags=tags)
+                time.sleep(0.3)
+        elif USE_OFFLINE_OSM:
             # Offline mode: use local PBF extracts
             reader = _get_offline_reader()
-            bbox = point_dist_to_bbox(point, dist)
-            data = reader.get_features(bbox, tags, clip_to_bbox=True)
+            point_bbox = point_dist_to_bbox(point, dist)
+            data = reader.get_features(point_bbox, tags, clip_to_bbox=True)
             print(f"✓ Loaded {name} from offline OSM (bbox extract)")
         else:
             # Online mode: use OSMnx/Overpass API
@@ -458,8 +673,52 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto"):
     print(f"\nGenerating map for {city}, {country}...")
+
+    # When bbox is provided, expand to cover the aspect-ratio-adjusted crop area.
+    # For city-level bboxes, expand fully so roads fill the poster frame.
+    # For large bboxes (countries), use modest padding — empty areas are ocean/bg.
+    fetch_bbox = None
+    if bbox is not None:
+        west, south, east, north = bbox
+        center_lat = (south + north) / 2
+        center_lon = (west + east) / 2
+        half_lon = (east - west) / 2
+        half_lat = (north - south) / 2
+        # Estimate bbox area in km²
+        width_km = (east - west) * 111 * abs(math.cos(math.radians(center_lat)))
+        height_km = (north - south) * 111
+        area_km2 = width_km * height_km
+
+        # Expand only the dimension that's too short for the poster aspect ratio
+        poster_aspect = width / height  # e.g. 0.75 for 6x8
+        cos_lat = abs(math.cos(math.radians(center_lat)))
+        bbox_width_km = half_lon * 2 * 111 * cos_lat
+        bbox_height_km = half_lat * 2 * 111
+        bbox_aspect = bbox_width_km / bbox_height_km
+
+        pad = 0.1  # 10% buffer on untouched dimension
+        if bbox_aspect > poster_aspect:
+            # bbox wider than needed → expand height only
+            target_half_lat = (half_lon * cos_lat) / poster_aspect / 111 / 2 * 2
+            # Simpler: target_height_km = bbox_width_km / poster_aspect
+            target_half_lat = bbox_width_km / poster_aspect / 2 / 111
+            fetch_bbox = (
+                west - half_lon * pad,
+                center_lat - target_half_lat * (1 + pad),
+                east + half_lon * pad,
+                center_lat + target_half_lat * (1 + pad),
+            )
+        else:
+            # bbox taller than needed → expand width only
+            target_half_lon = bbox_height_km * poster_aspect / 2 / 111 / cos_lat
+            fetch_bbox = (
+                center_lon - target_half_lon * (1 + pad),
+                south - half_lat * pad,
+                center_lon + target_half_lon * (1 + pad),
+                north + half_lat * pad,
+            )
 
     # Calculate total steps for progress bar
     total_steps = 3  # street network, water, parks
@@ -472,97 +731,130 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     if terrain:
         total_steps += 1
 
+    # Decide whether to use offline roads (GeoDataFrame) or online graph
+    use_offline_roads = USE_OFFLINE_OSM and fetch_bbox is not None
+    resolved_road_detail = resolve_road_detail(road_detail, bbox=bbox)
+
     # Progress bar for data fetching
     with tqdm(total=total_steps, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
-        pbar.set_description("Downloading street network")
-        compensated_dist = dist * (max(height, width) / min(height, width))/4 # To compensate for viewport crop
-        G = fetch_graph(point, compensated_dist)
-        if G is None:
-            raise RuntimeError("Failed to retrieve street network data.")
+        G = None
+        roads_gdf = None
+        if use_offline_roads:
+            pbar.set_description("Loading roads from offline OSM")
+            roads_gdf = fetch_roads_offline(fetch_bbox, road_detail=resolved_road_detail)
+            if roads_gdf is None or roads_gdf.empty:
+                raise RuntimeError("Failed to retrieve road data from offline PBF.")
+        else:
+            pbar.set_description("Downloading street network")
+            if fetch_bbox is not None:
+                G = fetch_graph(point, dist, bbox=fetch_bbox)
+            else:
+                compensated_dist = dist * (max(height, width) / min(height, width))/4 # To compensate for viewport crop
+                G = fetch_graph(point, compensated_dist)
+            if G is None:
+                raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
-        
-        # 2. Fetch Water Features
+
+        # For point+dist mode, use compensated_dist for features; for bbox mode, use fetch_bbox
+        feat_dist = None if fetch_bbox else compensated_dist
+
+        # 2. Fetch Water Features (inland only — bays removed, they create dark ocean blobs)
         pbar.set_description("Downloading water features")
-        water = fetch_features(point, compensated_dist, tags={'natural': ['water', 'bay'], 'waterway': 'riverbank'}, name='water')
+        water = fetch_features(point, feat_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water', bbox=fetch_bbox)
         pbar.update(1)
-        
+
         # 3. Fetch Parks
         pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(point, compensated_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
+        parks = fetch_features(point, feat_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks', bbox=fetch_bbox)
         pbar.update(1)
 
         # 4. Fetch Coastlines (optional)
         coastlines_data = None
         if coastline:
             pbar.set_description("Downloading coastlines")
-            coastlines_data = fetch_features(point, compensated_dist, tags={'natural': 'coastline'}, name='coastlines')
+            coastlines_data = fetch_features(point, feat_dist, tags={'natural': 'coastline'}, name='coastlines', bbox=fetch_bbox)
             pbar.update(1)
 
         # 5. Fetch Borders (optional)
         borders_data = None
         if borders_level is not None:
             pbar.set_description(f"Downloading admin borders (level {borders_level})")
-            borders_data = fetch_features(point, compensated_dist, tags={'boundary': 'administrative', 'admin_level': str(borders_level)}, name=f'borders_L{borders_level}')
+            borders_data = fetch_features(point, feat_dist, tags={'boundary': 'administrative', 'admin_level': str(borders_level)}, name=f'borders_L{borders_level}', bbox=fetch_bbox)
             pbar.update(1)
 
         # 6. Fetch Glaciers (optional)
         glaciers_data = None
         if glaciers:
             pbar.set_description("Downloading glaciers")
-            glaciers_data = fetch_features(point, compensated_dist, tags={'natural': 'glacier'}, name='glaciers')
+            glaciers_data = fetch_features(point, feat_dist, tags={'natural': 'glacier'}, name='glaciers', bbox=fetch_bbox)
             pbar.update(1)
 
         # 7. Fetch Terrain (optional)
         terrain_data = None
         if terrain:
             pbar.set_description("Downloading terrain features")
-            terrain_data = fetch_features(point, compensated_dist, tags={'natural': ['bare_rock', 'scree', 'fell', 'tundra', 'cliff', 'rock']}, name='terrain')
+            terrain_data = fetch_features(point, feat_dist, tags={'natural': ['bare_rock', 'scree', 'fell', 'tundra', 'cliff', 'rock']}, name='terrain', bbox=fetch_bbox)
             pbar.update(1)
 
     print("✓ All data retrieved successfully!")
     
-    # 2. Setup Plot
+    # 2. Setup Plot — background is water color, land polygons fill landmass
     print("Rendering map...")
-    fig, ax = plt.subplots(figsize=(width, height), facecolor=THEME['bg'])
-    ax.set_facecolor(THEME['bg'])
+    water_bg = THEME.get('water', THEME['bg'])
+    fig, ax = plt.subplots(figsize=(width, height), facecolor=water_bg)
+    ax.set_facecolor(water_bg)
     ax.set_position((0.0, 0.0, 1.0, 1.0))
 
-    # Project graph to a metric CRS so distances and aspect are linear (meters)
-    G_proj = ox.project_graph(G)
-    
+    # Project to a metric CRS so distances and aspect are linear (meters)
+    G_proj = None
+    lat, lon = point
+    if use_offline_roads:
+        # Derive UTM CRS from center point (no graph available)
+        utm_zone = int((lon + 180) / 6) + 1
+        hemisphere = "north" if lat >= 0 else "south"
+        epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+        target_crs = f"EPSG:{epsg}"
+        roads_proj = roads_gdf.to_crs(target_crs)
+    else:
+        G_proj = ox.project_graph(G)
+        target_crs = G_proj.graph["crs"]
+
+    def project_features(gdf):
+        """Project a GeoDataFrame to the target CRS."""
+        try:
+            return ox.projection.project_gdf(gdf)
+        except Exception:
+            return gdf.to_crs(target_crs)
+
     # 3. Plot Layers
-    # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
+    # Layer 0: Land polygons — fills landmass over water background
+    land_clip_bbox = fetch_bbox if fetch_bbox else (lon - 1, lat - 1, lon + 1, lat + 1)
+    land_gdf = _get_land_polygons(clip_bbox=land_clip_bbox)
+    if land_gdf is not None:
+        clip_box = box(land_clip_bbox[0], land_clip_bbox[1], land_clip_bbox[2], land_clip_bbox[3])
+        land_clipped = land_gdf.clip(clip_box)
+        if not land_clipped.empty:
+            land_proj = project_features(land_clipped)
+            land_proj.plot(ax=ax, facecolor=THEME['bg'], edgecolor='none', zorder=0)
+
     if water is not None and not water.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
         water_polys = water[water.geometry.type.isin(['Polygon', 'MultiPolygon'])]
         if not water_polys.empty:
-            # Project water features in the same CRS as the graph
-            try:
-                water_polys = ox.projection.project_gdf(water_polys)
-            except Exception:
-                water_polys = water_polys.to_crs(G_proj.graph['crs'])
+            water_polys = project_features(water_polys)
             water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
-    
+
     if parks is not None and not parks.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
         parks_polys = parks[parks.geometry.type.isin(['Polygon', 'MultiPolygon'])]
         if not parks_polys.empty:
-            # Project park features in the same CRS as the graph
-            try:
-                parks_polys = ox.projection.project_gdf(parks_polys)
-            except Exception:
-                parks_polys = parks_polys.to_crs(G_proj.graph['crs'])
+            parks_polys = project_features(parks_polys)
             parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
 
     # Layer 1a: Glaciers (optional)
     if glaciers_data is not None and not glaciers_data.empty:
         glaciers_polys = glaciers_data[glaciers_data.geometry.type.isin(['Polygon', 'MultiPolygon'])]
         if not glaciers_polys.empty:
-            try:
-                glaciers_polys = ox.projection.project_gdf(glaciers_polys)
-            except Exception:
-                glaciers_polys = glaciers_polys.to_crs(G_proj.graph['crs'])
+            glaciers_polys = project_features(glaciers_polys)
             glacier_color = THEME.get('glaciers', '#CEEAEE')
             glaciers_polys.plot(ax=ax, facecolor=glacier_color, edgecolor='none', zorder=0)
 
@@ -570,10 +862,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     if terrain_data is not None and not terrain_data.empty:
         terrain_polys = terrain_data[terrain_data.geometry.type.isin(['Polygon', 'MultiPolygon'])]
         if not terrain_polys.empty:
-            try:
-                terrain_polys = ox.projection.project_gdf(terrain_polys)
-            except Exception:
-                terrain_polys = terrain_polys.to_crs(G_proj.graph['crs'])
+            terrain_polys = project_features(terrain_polys)
             terrain_color = THEME.get('terrain', '#D4C4B0')
             terrain_polys.plot(ax=ax, facecolor=terrain_color, edgecolor='none', zorder=1)
 
@@ -581,39 +870,44 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     if coastlines_data is not None and not coastlines_data.empty:
         coastline_lines = coastlines_data[coastlines_data.geometry.type.isin(['LineString', 'MultiLineString'])]
         if not coastline_lines.empty:
-            try:
-                coastline_lines = ox.projection.project_gdf(coastline_lines)
-            except Exception:
-                coastline_lines = coastline_lines.to_crs(G_proj.graph['crs'])
+            coastline_lines = project_features(coastline_lines)
             coastline_color = THEME.get('coastline', THEME['text'])
-            coastline_lines.plot(ax=ax, edgecolor=coastline_color, linewidth=0.8, zorder=3)
+            coastline_width = 0.5 * {"low": 0.3, "medium": 0.4, "high": 1.0}.get(resolved_road_detail, 1.0)
+            coastline_lines.plot(ax=ax, edgecolor=coastline_color, linewidth=coastline_width, zorder=3)
 
     # Layer 1c: Administrative borders (optional)
     if borders_data is not None and not borders_data.empty:
         border_lines = borders_data[borders_data.geometry.type.isin(['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon'])]
         if not border_lines.empty:
-            try:
-                border_lines = ox.projection.project_gdf(border_lines)
-            except Exception:
-                border_lines = border_lines.to_crs(G_proj.graph['crs'])
+            border_lines = project_features(border_lines)
             border_color = THEME.get('borders', THEME['text'])
             border_lines.plot(ax=ax, facecolor='none', edgecolor=border_color, linewidth=0.6, linestyle='--', zorder=3)
 
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
-    edge_colors = get_edge_colors_by_type(G_proj)
-    edge_widths = get_edge_widths_by_type(G_proj)
+    crop_xlim, crop_ylim = get_crop_limits(target_crs, point, fig, feat_dist if feat_dist else dist, bbox=bbox)
 
-    # Determine cropping limits to maintain the poster aspect ratio
-    crop_xlim, crop_ylim = get_crop_limits(G_proj, point, fig, compensated_dist)
-    # Plot the projected graph and then apply the cropped limits
-    ox.plot_graph(
-        G_proj, ax=ax, bgcolor=THEME['bg'],
-        node_size=0,
-        edge_color=edge_colors,
-        edge_linewidth=edge_widths,
-        show=False, close=False
-    )
+    if use_offline_roads:
+        # Scale road widths by detail level (thinner at country zoom)
+        width_scale = {"low": 0.3, "medium": 0.4, "high": 1.0}.get(resolved_road_detail, 1.0)
+        colors = roads_proj['highway'].apply(get_road_color)
+        widths = roads_proj['highway'].apply(lambda h: get_road_width(h) * width_scale)
+        for (color, width_val), group in roads_proj.groupby([colors, widths]):
+            group.plot(ax=ax, edgecolor=color, linewidth=width_val, zorder=4)
+        # Hide axis decorations (ox.plot_graph does this automatically)
+        ax.set_axis_off()
+    else:
+        # Plot roads from OSMnx graph (online mode)
+        edge_colors = get_edge_colors_by_type(G_proj)
+        edge_widths = get_edge_widths_by_type(G_proj)
+        ox.plot_graph(
+            G_proj, ax=ax, bgcolor=THEME['bg'],
+            node_size=0,
+            edge_color=edge_colors,
+            edge_linewidth=edge_widths,
+            show=False, close=False
+        )
+
     ax.set_aspect('equal', adjustable='box')
     ax.set_xlim(crop_xlim)
     ax.set_ylim(crop_ylim)
@@ -705,7 +999,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     print(f"Saving to {output_file}...")
 
     fmt = output_format.lower()
-    save_kwargs = dict(facecolor=THEME["bg"], bbox_inches="tight", pad_inches=0.05,)
+    save_kwargs = dict(facecolor=water_bg, pad_inches=0,)
 
     # DPI matters mainly for raster formats
     if fmt == "png":
@@ -819,6 +1113,7 @@ Examples:
     parser.add_argument('--theme', '-t', type=str, default='feature_based', help='Theme name (default: feature_based)')
     parser.add_argument('--all-themes', '--All-themes', dest='all_themes', action='store_true', help='Generate posters for all themes')
     parser.add_argument('--distance', '-d', type=int, default=29000, help='Map radius in meters (default: 29000)')
+    parser.add_argument('--bbox', type=str, help='Bounding box as west,south,east,north (decimal degrees). Overrides --distance')
     parser.add_argument('--width', '-W', type=float, default=12, help='Image width in inches (default: 12)')
     parser.add_argument('--height', '-H', type=float, default=16, help='Image height in inches (default: 16)')
     parser.add_argument('--list-themes', action='store_true', help='List all available themes')
@@ -831,6 +1126,7 @@ Examples:
     parser.add_argument('--borders', type=int, metavar='LEVEL', help='Show administrative borders (2=country, 4=state/region, 6=county)')
     parser.add_argument('--glaciers', action='store_true', help='Show glaciers/ice sheets')
     parser.add_argument('--experimental-terrain', dest='terrain', action='store_true', help='Show terrain features (bare rock, scree, cliffs, tundra)')
+    parser.add_argument('--road-detail', default='auto', choices=['auto', 'low', 'medium', 'high'], help='Road detail level (default: auto, based on bbox area)')
 
     args = parser.parse_args()
     
@@ -844,19 +1140,38 @@ Examples:
         list_themes()
         sys.exit(0)
 
+    # Parse bbox if provided
+    parsed_bbox = None
+    if args.bbox:
+        try:
+            parts = [float(x.strip()) for x in args.bbox.split(',')]
+            if len(parts) != 4:
+                raise ValueError("Expected 4 values")
+            parsed_bbox = tuple(parts)  # (west, south, east, north)
+        except ValueError:
+            print("Error: --bbox must be 4 comma-separated numbers: west,south,east,north\n")
+            sys.exit(1)
+
     # Validate lat/lon: if one is provided, both must be provided
     if (args.lat is None) != (args.lon is None):
         print("Error: --lat and --lon must be used together.\n")
         sys.exit(1)
 
-    # Validate required arguments
+    # When bbox is provided, derive center coords from it
     has_coordinates = args.lat is not None and args.lon is not None
+    if parsed_bbox and not has_coordinates:
+        west, south, east, north = parsed_bbox
+        args.lat = (south + north) / 2
+        args.lon = (west + east) / 2
+        has_coordinates = True
+
+    # Validate required arguments
     if not args.city:
         print("Error: --city is required.\n")
         print_examples()
         sys.exit(1)
     if not has_coordinates and not args.country:
-        print("Error: --country is required (unless using --lat/--lon).\n")
+        print("Error: --country is required (unless using --lat/--lon or --bbox).\n")
         print_examples()
         sys.exit(1)
     
@@ -890,7 +1205,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
