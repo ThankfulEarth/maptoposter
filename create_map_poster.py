@@ -673,7 +673,7 @@ def fetch_features(point, dist, tags, name, bbox=None) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto"):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", progress_callback=None):
     print(f"\nGenerating map for {city}, {country}...")
 
     # When bbox is provided, expand to cover the aspect-ratio-adjusted crop area.
@@ -730,6 +730,15 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         total_steps += 1
     if terrain:
         total_steps += 1
+    total_steps += 3  # renderingMap, applyingStyles, savingPoster
+
+    current_step = 0
+
+    def report_progress(step_id, output_path=None):
+        nonlocal current_step
+        current_step += 1
+        if progress_callback:
+            progress_callback(step_id, current_step, total_steps, output_path=output_path)
 
     # Decide whether to use offline roads (GeoDataFrame) or online graph
     use_offline_roads = USE_OFFLINE_OSM and fetch_bbox is not None
@@ -755,6 +764,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             if G is None:
                 raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
+        report_progress("fetchingRoads")
 
         # For point+dist mode, use compensated_dist for features; for bbox mode, use fetch_bbox
         feat_dist = None if fetch_bbox else compensated_dist
@@ -763,11 +773,13 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         pbar.set_description("Downloading water features")
         water = fetch_features(point, feat_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water', bbox=fetch_bbox)
         pbar.update(1)
+        report_progress("fetchingWater")
 
         # 3. Fetch Parks
         pbar.set_description("Downloading parks/green spaces")
         parks = fetch_features(point, feat_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks', bbox=fetch_bbox)
         pbar.update(1)
+        report_progress("fetchingParks")
 
         # 4. Fetch Coastlines (optional)
         coastlines_data = None
@@ -775,6 +787,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             pbar.set_description("Downloading coastlines")
             coastlines_data = fetch_features(point, feat_dist, tags={'natural': 'coastline'}, name='coastlines', bbox=fetch_bbox)
             pbar.update(1)
+            report_progress("fetchingCoastlines")
 
         # 5. Fetch Borders (optional)
         borders_data = None
@@ -782,6 +795,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             pbar.set_description(f"Downloading admin borders (level {borders_level})")
             borders_data = fetch_features(point, feat_dist, tags={'boundary': 'administrative', 'admin_level': str(borders_level)}, name=f'borders_L{borders_level}', bbox=fetch_bbox)
             pbar.update(1)
+            report_progress("fetchingBorders")
 
         # 6. Fetch Glaciers (optional)
         glaciers_data = None
@@ -789,6 +803,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             pbar.set_description("Downloading glaciers")
             glaciers_data = fetch_features(point, feat_dist, tags={'natural': 'glacier'}, name='glaciers', bbox=fetch_bbox)
             pbar.update(1)
+            report_progress("fetchingGlaciers")
 
         # 7. Fetch Terrain (optional)
         terrain_data = None
@@ -796,11 +811,13 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             pbar.set_description("Downloading terrain features")
             terrain_data = fetch_features(point, feat_dist, tags={'natural': ['bare_rock', 'scree', 'fell', 'tundra', 'cliff', 'rock']}, name='terrain', bbox=fetch_bbox)
             pbar.update(1)
+            report_progress("fetchingTerrain")
 
     print("✓ All data retrieved successfully!")
     
     # 2. Setup Plot — background is water color, land polygons fill landmass
     print("Rendering map...")
+    report_progress("renderingMap")
     water_bg = THEME.get('water', THEME['bg'])
     fig, ax = plt.subplots(figsize=(width, height), facecolor=water_bg)
     ax.set_facecolor(water_bg)
@@ -885,6 +902,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
 
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
+    report_progress("applyingStyles")
     crop_xlim, crop_ylim = get_crop_limits(target_crs, point, fig, feat_dist if feat_dist else dist, bbox=bbox)
 
     if use_offline_roads:
@@ -997,6 +1015,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
 
     # 5. Save
     print(f"Saving to {output_file}...")
+    report_progress("savingPoster")
 
     fmt = output_format.lower()
     save_kwargs = dict(facecolor=water_bg, pad_inches=0,)
@@ -1009,6 +1028,9 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
 
     plt.close()
     print(f"✓ Done! Poster saved as {output_file}")
+
+    if progress_callback:
+        progress_callback("complete", total_steps, total_steps, output_path=output_file)
 
 
 def print_examples():
@@ -1127,6 +1149,7 @@ Examples:
     parser.add_argument('--glaciers', action='store_true', help='Show glaciers/ice sheets')
     parser.add_argument('--experimental-terrain', dest='terrain', action='store_true', help='Show terrain features (bare rock, scree, cliffs, tundra)')
     parser.add_argument('--road-detail', default='auto', choices=['auto', 'low', 'medium', 'high'], help='Road detail level (default: auto, based on bbox area)')
+    parser.add_argument('--progress', action='store_true', help='Emit machine-readable PROGRESS: lines to stdout')
 
     args = parser.parse_args()
     
@@ -1192,7 +1215,15 @@ Examples:
     print("=" * 50)
     print("City Map Poster Generator")
     print("=" * 50)
-    
+
+    def _progress_callback(step_id, step, total_steps, output_path=None):
+        obj = {"stepId": step_id, "step": step, "totalSteps": total_steps}
+        if output_path is not None:
+            obj["outputPath"] = str(output_path)
+        print(f"PROGRESS:{json.dumps(obj)}", flush=True)
+
+    progress_cb = _progress_callback if args.progress else None
+
     # Get coordinates and generate poster
     try:
         if args.lat is not None and args.lon is not None:
@@ -1205,7 +1236,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, progress_callback=progress_cb)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
