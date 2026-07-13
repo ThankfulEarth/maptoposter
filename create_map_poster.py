@@ -1150,6 +1150,12 @@ Examples:
     parser.add_argument('--experimental-terrain', dest='terrain', action='store_true', help='Show terrain features (bare rock, scree, cliffs, tundra)')
     parser.add_argument('--road-detail', default='auto', choices=['auto', 'low', 'medium', 'high'], help='Road detail level (default: auto, based on bbox area)')
     parser.add_argument('--progress', action='store_true', help='Emit machine-readable PROGRESS: lines to stdout')
+    parser.add_argument('--colors-json', dest='colors_json', type=str, help='JSON string with full color overrides (snake_case keys). Skips theme file loading.')
+    parser.add_argument('--no-water', dest='no_water', action='store_true', help='Disable water features')
+    parser.add_argument('--no-parks', dest='no_parks', action='store_true', help='Disable park features')
+    parser.add_argument('--no-roads', dest='no_roads', action='store_true', help='Disable road features')
+    parser.add_argument('--buildings', dest='buildings', action='store_true', help='Enable building footprints (capped at 200km² bbox area)')
+    parser.add_argument('--font', type=str, help='Font ID for poster typography (downloads from Google Fonts if needed)')
 
     args = parser.parse_args()
     
@@ -1205,6 +1211,8 @@ Examples:
 
     if args.all_themes:
         themes_to_generate = available_themes
+    elif args.colors_json:
+        themes_to_generate = [args.theme]
     else:
         if args.theme not in available_themes:
             print(f"Error: Theme '{args.theme}' not found.")
@@ -1234,7 +1242,12 @@ Examples:
 
         country_for_poster = args.country if args.country else ""
         for theme_name in themes_to_generate:
-            THEME = load_theme(theme_name)
+            if args.colors_json:
+                THEME = json.loads(args.colors_json)
+                THEME.setdefault("name", theme_name)
+                print(f"✓ Using colors from --colors-json for theme: {theme_name}")
+            else:
+                THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
             create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, progress_callback=progress_cb)
         
