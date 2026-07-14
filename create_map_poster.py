@@ -686,7 +686,12 @@ def resolve_layers(no_water: bool, no_parks: bool, no_roads: bool) -> dict:
     return {"water": not no_water, "parks": not no_parks, "roads": not no_roads}
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, progress_callback=None):
+def buildings_allowed(area_km2: float, cap_km2: float = 200.0) -> bool:
+    """Buildings are fetched only for bboxes at or under the area cap."""
+    return area_km2 <= cap_km2
+
+
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, draw_buildings=False, progress_callback=None):
     print(f"\nGenerating map for {city}, {country}...")
 
     # When bbox is provided, expand to cover the aspect-ratio-adjusted crop area.
@@ -734,7 +739,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             )
 
     # Calculate total steps for progress bar
-    total_steps = 3  # street network, water, parks
+    total_steps = 4  # street network, water, parks, buildings
     if coastline:
         total_steps += 1
     if borders_level is not None:
@@ -801,6 +806,16 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             parks = fetch_features(point, feat_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks', bbox=fetch_bbox)
         pbar.update(1)
         report_progress("fetchingParks")
+
+        # 3b. Fetch Buildings (optional, capped by bbox area)
+        buildings = None
+        if draw_buildings:
+            if bbox is not None and not buildings_allowed(area_km2):
+                print(f"⚠ Skipping buildings: bbox area {area_km2:.0f} km² exceeds 200 km² cap")
+            else:
+                pbar.set_description("Downloading buildings")
+                buildings = fetch_features(point, feat_dist, tags={'building': True}, name='buildings', bbox=fetch_bbox)
+        report_progress("fetchingBuildings")
 
         # 4. Fetch Coastlines (optional)
         coastlines_data = None
@@ -889,6 +904,13 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if not parks_polys.empty:
             parks_polys = project_features(parks_polys)
             parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
+
+    if buildings is not None and not buildings.empty:
+        building_polys = buildings[buildings.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+        if not building_polys.empty:
+            building_polys = project_features(building_polys)
+            building_color = THEME.get('building', THEME.get('road_residential', THEME['text']))
+            building_polys.plot(ax=ax, facecolor=building_color, edgecolor='none', zorder=2.5)
 
     # Layer 1a: Glaciers (optional)
     if glaciers_data is not None and not glaciers_data.empty:
@@ -1278,7 +1300,7 @@ Examples:
             else:
                 THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], progress_callback=progress_cb)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], draw_buildings=args.buildings, progress_callback=progress_cb)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
