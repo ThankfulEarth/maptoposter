@@ -543,6 +543,14 @@ def resolve_road_detail(road_detail: str, bbox=None) -> str:
     return level
 
 
+def utm_crs_from_point(lat: float, lon: float) -> str:
+    """Derive the UTM EPSG code for a center point, independent of any road data."""
+    utm_zone = int((lon + 180) / 6) + 1
+    hemisphere = "north" if lat >= 0 else "south"
+    epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
+    return f"EPSG:{epsg}"
+
+
 def fetch_roads_offline(bbox, road_detail: str = "high") -> GeoDataFrame | None:
     """
     Fetch road geometries from offline PBF extracts.
@@ -673,7 +681,12 @@ def fetch_features(point, dist, tags, name, bbox=None) -> GeoDataFrame | None:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", progress_callback=None):
+def resolve_layers(no_water: bool, no_parks: bool, no_roads: bool) -> dict:
+    """Map --no-* flags to a draw/skip decision per layer (True = draw)."""
+    return {"water": not no_water, "parks": not no_parks, "roads": not no_roads}
+
+
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, progress_callback=None):
     print(f"\nGenerating map for {city}, {country}...")
 
     # When bbox is provided, expand to cover the aspect-ratio-adjusted crop area.
@@ -744,25 +757,29 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     use_offline_roads = USE_OFFLINE_OSM and fetch_bbox is not None
     resolved_road_detail = resolve_road_detail(road_detail, bbox=bbox)
 
+    # Compensated distance is needed for feature fetch radius and crop limits
+    # regardless of whether roads are drawn, so it's computed unconditionally.
+    compensated_dist = dist * (max(height, width) / min(height, width)) / 4  # To compensate for viewport crop
+
     # Progress bar for data fetching
     with tqdm(total=total_steps, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
         G = None
         roads_gdf = None
-        if use_offline_roads:
-            pbar.set_description("Loading roads from offline OSM")
-            roads_gdf = fetch_roads_offline(fetch_bbox, road_detail=resolved_road_detail)
-            if roads_gdf is None or roads_gdf.empty:
-                raise RuntimeError("Failed to retrieve road data from offline PBF.")
-        else:
-            pbar.set_description("Downloading street network")
-            if fetch_bbox is not None:
-                G = fetch_graph(point, dist, bbox=fetch_bbox)
+        if draw_roads:
+            if use_offline_roads:
+                pbar.set_description("Loading roads from offline OSM")
+                roads_gdf = fetch_roads_offline(fetch_bbox, road_detail=resolved_road_detail)
+                if roads_gdf is None or roads_gdf.empty:
+                    raise RuntimeError("Failed to retrieve road data from offline PBF.")
             else:
-                compensated_dist = dist * (max(height, width) / min(height, width))/4 # To compensate for viewport crop
-                G = fetch_graph(point, compensated_dist)
-            if G is None:
-                raise RuntimeError("Failed to retrieve street network data.")
+                pbar.set_description("Downloading street network")
+                if fetch_bbox is not None:
+                    G = fetch_graph(point, dist, bbox=fetch_bbox)
+                else:
+                    G = fetch_graph(point, compensated_dist)
+                if G is None:
+                    raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
         report_progress("fetchingRoads")
 
@@ -770,14 +787,18 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         feat_dist = None if fetch_bbox else compensated_dist
 
         # 2. Fetch Water Features (inland only — bays removed, they create dark ocean blobs)
-        pbar.set_description("Downloading water features")
-        water = fetch_features(point, feat_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water', bbox=fetch_bbox)
+        water = None
+        if draw_water:
+            pbar.set_description("Downloading water features")
+            water = fetch_features(point, feat_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water', bbox=fetch_bbox)
         pbar.update(1)
         report_progress("fetchingWater")
 
         # 3. Fetch Parks
-        pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(point, feat_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks', bbox=fetch_bbox)
+        parks = None
+        if draw_parks:
+            pbar.set_description("Downloading parks/green spaces")
+            parks = fetch_features(point, feat_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks', bbox=fetch_bbox)
         pbar.update(1)
         report_progress("fetchingParks")
 
@@ -825,13 +846,15 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
 
     # Project to a metric CRS so distances and aspect are linear (meters)
     G_proj = None
+    roads_proj = None
     lat, lon = point
-    if use_offline_roads:
+    if not draw_roads:
+        # No road data was fetched — derive the CRS from the center point's UTM
+        # zone directly, independent of any road graph/GeoDataFrame.
+        target_crs = utm_crs_from_point(lat, lon)
+    elif use_offline_roads:
         # Derive UTM CRS from center point (no graph available)
-        utm_zone = int((lon + 180) / 6) + 1
-        hemisphere = "north" if lat >= 0 else "south"
-        epsg = 32600 + utm_zone if hemisphere == "north" else 32700 + utm_zone
-        target_crs = f"EPSG:{epsg}"
+        target_crs = utm_crs_from_point(lat, lon)
         roads_proj = roads_gdf.to_crs(target_crs)
     else:
         G_proj = ox.project_graph(G)
@@ -905,26 +928,31 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     report_progress("applyingStyles")
     crop_xlim, crop_ylim = get_crop_limits(target_crs, point, fig, feat_dist if feat_dist else dist, bbox=bbox)
 
-    if use_offline_roads:
-        # Scale road widths by detail level (thinner at country zoom)
-        width_scale = {"low": 0.3, "medium": 0.4, "high": 1.0}.get(resolved_road_detail, 1.0)
-        colors = roads_proj['highway'].apply(get_road_color)
-        widths = roads_proj['highway'].apply(lambda h: get_road_width(h) * width_scale)
-        for (color, width_val), group in roads_proj.groupby([colors, widths]):
-            group.plot(ax=ax, edgecolor=color, linewidth=width_val, zorder=4)
-        # Hide axis decorations (ox.plot_graph does this automatically)
-        ax.set_axis_off()
+    if draw_roads:
+        if use_offline_roads:
+            # Scale road widths by detail level (thinner at country zoom)
+            width_scale = {"low": 0.3, "medium": 0.4, "high": 1.0}.get(resolved_road_detail, 1.0)
+            colors = roads_proj['highway'].apply(get_road_color)
+            widths = roads_proj['highway'].apply(lambda h: get_road_width(h) * width_scale)
+            for (color, width_val), group in roads_proj.groupby([colors, widths]):
+                group.plot(ax=ax, edgecolor=color, linewidth=width_val, zorder=4)
+            # Hide axis decorations (ox.plot_graph does this automatically)
+            ax.set_axis_off()
+        else:
+            # Plot roads from OSMnx graph (online mode)
+            edge_colors = get_edge_colors_by_type(G_proj)
+            edge_widths = get_edge_widths_by_type(G_proj)
+            ox.plot_graph(
+                G_proj, ax=ax, bgcolor=THEME['bg'],
+                node_size=0,
+                edge_color=edge_colors,
+                edge_linewidth=edge_widths,
+                show=False, close=False
+            )
     else:
-        # Plot roads from OSMnx graph (online mode)
-        edge_colors = get_edge_colors_by_type(G_proj)
-        edge_widths = get_edge_widths_by_type(G_proj)
-        ox.plot_graph(
-            G_proj, ax=ax, bgcolor=THEME['bg'],
-            node_size=0,
-            edge_color=edge_colors,
-            edge_linewidth=edge_widths,
-            show=False, close=False
-        )
+        # No road graph/GeoDataFrame to plot — still hide axis decorations
+        # (ox.plot_graph would otherwise handle this automatically).
+        ax.set_axis_off()
 
     ax.set_aspect('equal', adjustable='box')
     ax.set_xlim(crop_xlim)
@@ -1241,6 +1269,7 @@ Examples:
             coords = get_coordinates(args.city, args.country)
 
         country_for_poster = args.country if args.country else ""
+        layers = resolve_layers(args.no_water, args.no_parks, args.no_roads)
         for theme_name in themes_to_generate:
             if args.colors_json:
                 THEME = json.loads(args.colors_json)
@@ -1249,7 +1278,7 @@ Examples:
             else:
                 THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, progress_callback=progress_cb)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], progress_callback=progress_cb)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
