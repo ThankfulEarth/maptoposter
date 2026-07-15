@@ -708,6 +708,13 @@ def buildings_allowed(area_km2: float, cap_km2: float = BUILDINGS_AREA_CAP_KM2) 
     return area_km2 <= cap_km2
 
 
+def format_coords(lat: float, lon: float) -> str:
+    """Format a lat/lon pair as e.g. '59.9139° N / 10.7522° E' or '33.8688° S / 70.6693° W'."""
+    lat_hem = "N" if lat >= 0 else "S"
+    lon_hem = "E" if lon >= 0 else "W"
+    return f"{abs(lat):.4f}° {lat_hem} / {abs(lon):.4f}° {lon_hem}"
+
+
 def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, draw_buildings=False, title_font=None, progress_callback=None):
     print(f"\nGenerating map for {city}, {country}...")
 
@@ -832,6 +839,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             else:
                 pbar.set_description("Downloading buildings")
                 buildings = fetch_features(point, feat_dist, tags={'building': True}, name='buildings', bbox=fetch_bbox)
+        pbar.update(1)
         report_progress("fetchingBuildings")
 
         # 4. Fetch Coastlines (optional)
@@ -1042,10 +1050,8 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
     
     lat, lon = point
-    coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
-    if lon < 0:
-        coords = coords.replace("E", "W")
-    
+    coords = format_coords(lat, lon)
+
     ax.text(0.5, 0.07, coords, transform=ax.transAxes,
             color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
     

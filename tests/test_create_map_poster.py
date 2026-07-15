@@ -21,6 +21,7 @@ from create_map_poster import (
     cache_get,
     cache_set,
     classify_highway,
+    format_coords,
     generate_output_filename,
     get_road_color,
     get_road_width,
@@ -342,6 +343,24 @@ class TestLoadTheme:
                 assert "bg" in result
                 assert "text" in result
                 assert result["name"] == "Feature-Based Shading"
+
+
+class TestFormatCoords:
+    """Tests for format_coords hemisphere labeling."""
+
+    def test_northern_eastern(self):
+        assert format_coords(59.9139, 10.7522) == "59.9139° N / 10.7522° E"
+
+    def test_southern_western(self):
+        assert format_coords(-33.8688, -70.6693) == "33.8688° S / 70.6693° W"
+
+    def test_western_longitude_has_no_minus_sign(self):
+        result = format_coords(40.7128, -74.0060)
+        assert result == "40.7128° N / 74.0060° W"
+        assert "-" not in result
+
+    def test_equator_and_prime_meridian(self):
+        assert format_coords(0.0, 0.0) == "0.0000° N / 0.0000° E"
 
 
 class TestGetAvailableThemes:
