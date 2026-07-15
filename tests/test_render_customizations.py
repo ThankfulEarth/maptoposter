@@ -20,7 +20,7 @@ import geopandas as gpd
 import numpy as np
 import pytest
 from PIL import Image
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 # Add parent directory to path for imports (matches the rest of the suite)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -64,6 +64,21 @@ def _color_present(image_path: Path, hex_color: str, tolerance: int = 12) -> boo
         arr = np.array(img.convert("RGB"), dtype=int)
     diff = np.abs(arr - target)
     return bool(np.any(np.all(diff <= tolerance, axis=-1)))
+
+
+def _text_pixels(image_path: Path, hex_color: str = SENTINEL_THEME["text"], tolerance: int = 12) -> int:
+    """Count of pixels in the PNG within `tolerance` of `hex_color` per channel.
+
+    Used to compare the THEME['text'] sentinel pixel count between renders:
+    the bottom title/coords/attribution text is always drawn in this color,
+    so presence alone can't prove labels rendered — but toggling draw_labels
+    on adds place/water label glyphs in the same color, so the *count* rises.
+    """
+    target = np.array(_hex_to_rgb(hex_color), dtype=int)
+    with Image.open(image_path) as img:
+        arr = np.array(img.convert("RGB"), dtype=int)
+    diff = np.abs(arr - target)
+    return int(np.count_nonzero(np.all(diff <= tolerance, axis=-1)))
 
 
 def _fixture_roads() -> gpd.GeoDataFrame:
@@ -130,6 +145,27 @@ def _fixture_land() -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame({"id": [1]}, geometry=[poly], crs="EPSG:4326")
 
 
+def _fixture_places() -> gpd.GeoDataFrame:
+    """A named city place at the bbox center, so its label lands well clear of
+    the bottom title/attribution text and isn't clipped by the crop."""
+    point = Point((WEST + EAST) / 2, (SOUTH + NORTH) / 2)
+    return gpd.GeoDataFrame({"name": ["SENTINELCITY"], "place": ["city"]}, geometry=[point], crs="EPSG:4326")
+
+
+def _fixture_water_names() -> gpd.GeoDataFrame:
+    """A named water polygon. create_map_poster only labels its centroid (it
+    doesn't fill the shape), so its extent only needs to stay inside the bbox."""
+    poly = Polygon(
+        [
+            (WEST + 0.013, SOUTH + 0.011),
+            (WEST + 0.017, SOUTH + 0.011),
+            (WEST + 0.017, SOUTH + 0.014),
+            (WEST + 0.013, SOUTH + 0.014),
+        ]
+    )
+    return gpd.GeoDataFrame({"name": ["Sentinel Bay"], "natural": ["water"]}, geometry=[poly], crs="EPSG:4326")
+
+
 @pytest.fixture
 def fixture_data_sources(monkeypatch):
     """Patch OSM data-source functions with small synthetic fixtures; no network/PBF."""
@@ -146,6 +182,10 @@ def fixture_data_sources(monkeypatch):
             return _fixture_parks()
         if name == "buildings":
             return _fixture_buildings()
+        if name == "places":
+            return _fixture_places()
+        if name == "water_names":
+            return _fixture_water_names()
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
     def fake_get_land_polygons(clip_bbox=None):
@@ -220,6 +260,33 @@ def test_buildings_layer_toggle_changes_pixels(tmp_path, fixture_data_sources):
 def test_render_with_default_title_font_produces_file(tmp_path, fixture_data_sources):
     """title_font=None falls back to bundled Roboto and still renders a real poster."""
     output = _render(tmp_path, "default_font", title_font=None)
+
+    assert output.exists()
+    assert output.stat().st_size > 1000
+
+
+@pytest.mark.slow
+def test_labels_render_and_toggle(tmp_path, fixture_data_sources):
+    """draw_labels=True paints the fixture place/water names in THEME['text'].
+
+    The bottom title/coords/attribution text is always drawn in THEME['text']
+    too, so its mere presence can't prove labels rendered — both the "on" and
+    "off" renders share that baseline text. What distinguishes them is that
+    "on" additionally draws the SENTINELCITY place label and Sentinel Bay
+    water label in the same color, so the *count* of sentinel-text pixels
+    must strictly increase versus "off" (all else identical).
+    """
+    on = _render(tmp_path, "labels_on", draw_labels=True, label_font="noto_sans")
+    off = _render(tmp_path, "labels_off", draw_labels=False, label_font="noto_sans")
+
+    assert _color_present(on, SENTINEL_THEME["text"])
+    assert not _color_present(off, SENTINEL_THEME["text"]) or _text_pixels(off) < _text_pixels(on)
+
+
+@pytest.mark.slow
+def test_label_font_serif_renders(tmp_path, fixture_data_sources):
+    """label_font='noto_serif' renders without error and produces a real poster."""
+    output = _render(tmp_path, "labels_serif", draw_labels=True, label_font="noto_serif")
 
     assert output.exists()
     assert output.stat().st_size > 1000
