@@ -722,9 +722,15 @@ def fetch_features(point, dist, tags, name, bbox=None) -> GeoDataFrame | None:
 
 
 
-def resolve_layers(no_water: bool, no_parks: bool, no_roads: bool, buildings: bool) -> dict:
-    """Map --no-*/--buildings flags to a draw/skip decision per layer (True = draw)."""
-    return {"water": not no_water, "parks": not no_parks, "roads": not no_roads, "buildings": buildings}
+def resolve_layers(no_water: bool, no_parks: bool, no_roads: bool, buildings: bool, no_labels: bool) -> dict:
+    """Map --no-*/--buildings/--no-labels flags to a draw/skip decision per layer (True = draw)."""
+    return {
+        "water": not no_water,
+        "parks": not no_parks,
+        "roads": not no_roads,
+        "buildings": buildings,
+        "labels": not no_labels,
+    }
 
 
 def buildings_allowed(area_km2: float, cap_km2: float = BUILDINGS_AREA_CAP_KM2) -> bool:
@@ -739,7 +745,59 @@ def format_coords(lat: float, lon: float) -> str:
     return f"{abs(lat):.4f}° {lat_hem} / {abs(lon):.4f}° {lon_hem}"
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, draw_buildings=False, title_font=None, progress_callback=None):
+PLACE_RANK = {
+    "country": 0,
+    "state": 1,
+    "city": 2,
+    "town": 3,
+    "village": 4,
+    "suburb": 5,
+    "neighbourhood": 6,
+}
+DEFAULT_PLACE_RANK = PLACE_RANK["town"]
+
+
+def _label_point(geometry):
+    """Return a representative Point for a label: the geometry itself if it's
+    already a point, otherwise its centroid (e.g. named water polygons)."""
+    return geometry if geometry.geom_type == "Point" else geometry.centroid
+
+
+def select_labels(features_gdf, max_labels: int = 25, min_dist_deg: float = 0.004):
+    """Rank place labels by importance and greedily drop ones too close to an
+    already-kept, higher-ranked label.
+
+    Ranking follows PLACE_RANK (country < state < city < town < village <
+    suburb < neighbourhood); rows with a missing/unrecognized `place` value,
+    or no `place` column at all, fall back to the "town" rank. Rows with no
+    `name` are dropped (nothing to label).
+    """
+    if features_gdf is None:
+        return None
+    if features_gdf.empty or "name" not in features_gdf.columns:
+        return features_gdf.iloc[0:0]
+
+    named = features_gdf[features_gdf["name"].notna()].copy()
+    if "place" in named.columns:
+        named["_rank"] = named["place"].map(lambda p: PLACE_RANK.get(p, DEFAULT_PLACE_RANK))
+    else:
+        named["_rank"] = DEFAULT_PLACE_RANK
+    named = named.sort_values("_rank", kind="stable")
+
+    kept_indices = []
+    kept_points = []
+    for idx, row in named.iterrows():
+        if len(kept_indices) >= max_labels:
+            break
+        point = _label_point(row.geometry)
+        if all(point.distance(kept) >= min_dist_deg for kept in kept_points):
+            kept_indices.append(idx)
+            kept_points.append(point)
+
+    return named.loc[kept_indices].drop(columns="_rank")
+
+
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, draw_buildings=False, title_font=None, draw_labels=True, label_font=None, progress_callback=None):
     print(f"\nGenerating map for {city}, {country}...")
 
     # When bbox is provided, expand to cover the aspect-ratio-adjusted crop area.
@@ -787,7 +845,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             )
 
     # Calculate total steps for progress bar
-    total_steps = 4  # street network, water, parks, buildings
+    total_steps = 5  # street network, water, parks, buildings, labels
     if coastline:
         total_steps += 1
     if borders_level is not None:
@@ -865,6 +923,16 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
                 buildings = fetch_features(point, feat_dist, tags={'building': True}, name='buildings', bbox=fetch_bbox)
         pbar.update(1)
         report_progress("fetchingBuildings")
+
+        # 3c. Fetch Place + Water Name Labels
+        places = None
+        water_names = None
+        if draw_labels:
+            pbar.set_description("Downloading place and water labels")
+            places = fetch_features(point, feat_dist, tags={'place': ['country', 'state', 'city', 'town', 'village', 'suburb', 'neighbourhood']}, name='places', bbox=fetch_bbox)
+            water_names = fetch_features(point, feat_dist, tags={'natural': 'water', 'name': True}, name='water_names', bbox=fetch_bbox)
+        pbar.update(1)
+        report_progress("fetchingLabels")
 
         # 4. Fetch Coastlines (optional)
         coastlines_data = None
@@ -1028,14 +1096,82 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     ax.set_aspect('equal', adjustable='box')
     ax.set_xlim(crop_xlim)
     ax.set_ylim(crop_ylim)
-    
+
+    # Calculate scale factor based on poster width (reference width 12 inches)
+    scale_factor = width / 12.0
+
+    # Layer 2b: Place + water name labels (labels toggle)
+    if draw_labels:
+        label_fonts = resolve_label_fonts(label_font)
+        BASE_LABEL_SIZES = {
+            "country": 18,
+            "state": 15,
+            "city": 12,
+            "town": 9,
+            "village": 8,
+            "suburb": 7,
+            "neighbourhood": 6,
+        }
+        DEFAULT_LABEL_SIZE = BASE_LABEL_SIZES["town"]
+        BASE_WATER_LABEL_SIZE = 9
+
+        selected_places = select_labels(places) if places is not None else None
+        if selected_places is not None and not selected_places.empty:
+            selected_places = project_features(selected_places)
+            has_place_col = "place" in selected_places.columns
+            has_capital_col = "capital" in selected_places.columns
+            for _, row in selected_places.iterrows():
+                name = row.get("name")
+                geometry = row.geometry
+                if not name or geometry is None or geometry.is_empty:
+                    continue
+                place_class = row.get("place") if has_place_col else None
+                if place_class not in PLACE_RANK:
+                    place_class = "town"
+                label_point = _label_point(geometry)
+                text = name.upper() if place_class in ("country", "state") else name
+                is_capital_city = place_class == "city" and (
+                    not has_capital_col or row.get("capital") in ("yes", "2", 2)
+                )
+                font_path = label_fonts["bold"] if is_capital_city else label_fonts["regular"]
+                font_size = BASE_LABEL_SIZES.get(place_class, DEFAULT_LABEL_SIZE) * scale_factor
+                ax.text(
+                    label_point.x, label_point.y, text,
+                    color=THEME['text'], ha='center', va='center',
+                    fontproperties=FontProperties(fname=font_path, size=font_size),
+                    zorder=6,
+                )
+
+        if (
+            water_names is not None
+            and not water_names.empty
+            and "natural" in water_names.columns
+            and "name" in water_names.columns
+        ):
+            named_water = water_names[
+                (water_names["natural"] == "water")
+                & water_names["name"].notna()
+                & water_names.geometry.type.isin(["Polygon", "MultiPolygon"])
+            ]
+            if not named_water.empty:
+                named_water = project_features(named_water)
+                font_water = FontProperties(fname=label_fonts["italic"], size=BASE_WATER_LABEL_SIZE * scale_factor)
+                for _, row in named_water.iterrows():
+                    name = row.get("name")
+                    geometry = row.geometry
+                    if not name or geometry is None or geometry.is_empty:
+                        continue
+                    label_point = geometry.centroid
+                    ax.text(
+                        label_point.x, label_point.y, name,
+                        color=THEME['text'], ha='center', va='center',
+                        fontproperties=font_water, zorder=6,
+                    )
+
     # Layer 3: Gradients (Top and Bottom)
     create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
     create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
-    
-    # Calculate scale factor based on poster width (reference width 12 inches)
-    scale_factor = width / 12.0
-    
+
     # Base font sizes (at 12 inches width)
     BASE_MAIN = 60
     BASE_TOP = 40
@@ -1241,6 +1377,8 @@ Examples:
     parser.add_argument('--no-roads', dest='no_roads', action='store_true', help='Disable road features')
     parser.add_argument('--buildings', dest='buildings', action='store_true', help=f'Enable building footprints (capped at {BUILDINGS_AREA_CAP_KM2:.0f}km² bbox area)')
     parser.add_argument('--title-font', dest='title_font', type=str, help='Font ID for poster title typography')
+    parser.add_argument('--label-font', dest='label_font', type=str, help='Font ID for in-map place/water labels')
+    parser.add_argument('--no-labels', dest='no_labels', action='store_true', help='Hide in-map place/water labels')
 
     args = parser.parse_args()
     
@@ -1326,7 +1464,7 @@ Examples:
             coords = get_coordinates(args.city, args.country)
 
         country_for_poster = args.country if args.country else ""
-        layers = resolve_layers(args.no_water, args.no_parks, args.no_roads, args.buildings)
+        layers = resolve_layers(args.no_water, args.no_parks, args.no_roads, args.buildings, args.no_labels)
         for theme_name in themes_to_generate:
             if args.colors_json:
                 THEME = json.loads(args.colors_json)
@@ -1335,7 +1473,7 @@ Examples:
             else:
                 THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], draw_buildings=layers["buildings"], title_font=args.title_font, progress_callback=progress_cb)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], draw_buildings=layers["buildings"], title_font=args.title_font, draw_labels=layers["labels"], label_font=args.label_font, progress_callback=progress_cb)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
