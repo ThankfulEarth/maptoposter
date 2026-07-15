@@ -143,6 +143,14 @@ THEMES_DIR = "themes"
 FONTS_DIR = "fonts"
 POSTERS_DIR = "posters"
 
+ROBOTO_TTF_PATHS = {
+    "bold": os.path.join(FONTS_DIR, "Roboto-Bold.ttf"),
+    "regular": os.path.join(FONTS_DIR, "Roboto-Regular.ttf"),
+    "light": os.path.join(FONTS_DIR, "Roboto-Light.ttf"),
+}
+
+BUILDINGS_AREA_CAP_KM2 = 200.0
+
 CACHE_DIR = ".cache"
 
 class CacheError(Exception):
@@ -181,12 +189,8 @@ def load_fonts():
     Load Roboto fonts from the fonts directory.
     Returns dict with font paths for different weights.
     """
-    fonts = {
-        'bold': os.path.join(FONTS_DIR, 'Roboto-Bold.ttf'),
-        'regular': os.path.join(FONTS_DIR, 'Roboto-Regular.ttf'),
-        'light': os.path.join(FONTS_DIR, 'Roboto-Light.ttf')
-    }
-    
+    fonts = dict(ROBOTO_TTF_PATHS)
+
     # Verify fonts exist
     for weight, path in fonts.items():
         if not os.path.exists(path):
@@ -200,11 +204,7 @@ FONTS = load_fonts()
 
 def resolve_title_fonts(title_font_id, fonts_root: str = FONTS_DIR) -> dict:
     """Return {bold,regular,light} ttf paths for the title font, or bundled Roboto."""
-    roboto = {
-        "bold": os.path.join(FONTS_DIR, "Roboto-Bold.ttf"),
-        "regular": os.path.join(FONTS_DIR, "Roboto-Regular.ttf"),
-        "light": os.path.join(FONTS_DIR, "Roboto-Light.ttf"),
-    }
+    roboto = dict(ROBOTO_TTF_PATHS)
     if not title_font_id:
         return roboto
     gen = os.path.join(fonts_root, "generated", title_font_id)
@@ -698,12 +698,12 @@ def fetch_features(point, dist, tags, name, bbox=None) -> GeoDataFrame | None:
 
 
 
-def resolve_layers(no_water: bool, no_parks: bool, no_roads: bool) -> dict:
-    """Map --no-* flags to a draw/skip decision per layer (True = draw)."""
-    return {"water": not no_water, "parks": not no_parks, "roads": not no_roads}
+def resolve_layers(no_water: bool, no_parks: bool, no_roads: bool, buildings: bool) -> dict:
+    """Map --no-*/--buildings flags to a draw/skip decision per layer (True = draw)."""
+    return {"water": not no_water, "parks": not no_parks, "roads": not no_roads, "buildings": buildings}
 
 
-def buildings_allowed(area_km2: float, cap_km2: float = 200.0) -> bool:
+def buildings_allowed(area_km2: float, cap_km2: float = BUILDINGS_AREA_CAP_KM2) -> bool:
     """Buildings are fetched only for bboxes at or under the area cap."""
     return area_km2 <= cap_km2
 
@@ -828,7 +828,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         buildings = None
         if draw_buildings:
             if bbox is not None and not buildings_allowed(area_km2):
-                print(f"⚠ Skipping buildings: bbox area {area_km2:.0f} km² exceeds 200 km² cap")
+                print(f"⚠ Skipping buildings: bbox area {area_km2:.0f} km² exceeds {BUILDINGS_AREA_CAP_KM2:.0f} km² cap")
             else:
                 pbar.set_description("Downloading buildings")
                 buildings = fetch_features(point, feat_dist, tags={'building': True}, name='buildings', bbox=fetch_bbox)
@@ -1209,7 +1209,7 @@ Examples:
     parser.add_argument('--no-water', dest='no_water', action='store_true', help='Disable water features')
     parser.add_argument('--no-parks', dest='no_parks', action='store_true', help='Disable park features')
     parser.add_argument('--no-roads', dest='no_roads', action='store_true', help='Disable road features')
-    parser.add_argument('--buildings', dest='buildings', action='store_true', help='Enable building footprints (capped at 200km² bbox area)')
+    parser.add_argument('--buildings', dest='buildings', action='store_true', help=f'Enable building footprints (capped at {BUILDINGS_AREA_CAP_KM2:.0f}km² bbox area)')
     parser.add_argument('--title-font', dest='title_font', type=str, help='Font ID for poster title typography')
 
     args = parser.parse_args()
@@ -1296,7 +1296,7 @@ Examples:
             coords = get_coordinates(args.city, args.country)
 
         country_for_poster = args.country if args.country else ""
-        layers = resolve_layers(args.no_water, args.no_parks, args.no_roads)
+        layers = resolve_layers(args.no_water, args.no_parks, args.no_roads, args.buildings)
         for theme_name in themes_to_generate:
             if args.colors_json:
                 THEME = json.loads(args.colors_json)
@@ -1305,7 +1305,7 @@ Examples:
             else:
                 THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], draw_buildings=args.buildings, title_font=args.title_font, progress_callback=progress_cb)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], draw_buildings=layers["buildings"], title_font=args.title_font, progress_callback=progress_cb)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
