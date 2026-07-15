@@ -197,6 +197,23 @@ def load_fonts():
 
 FONTS = load_fonts()
 
+
+def resolve_title_fonts(title_font_id, fonts_root: str = FONTS_DIR) -> dict:
+    """Return {bold,regular,light} ttf paths for the title font, or bundled Roboto."""
+    roboto = {
+        "bold": os.path.join(FONTS_DIR, "Roboto-Bold.ttf"),
+        "regular": os.path.join(FONTS_DIR, "Roboto-Regular.ttf"),
+        "light": os.path.join(FONTS_DIR, "Roboto-Light.ttf"),
+    }
+    if not title_font_id:
+        return roboto
+    gen = os.path.join(fonts_root, "generated", title_font_id)
+    resolved = {role: os.path.join(gen, f"{role}.ttf") for role in ("bold", "regular", "light")}
+    if all(os.path.exists(p) for p in resolved.values()):
+        return resolved
+    return roboto
+
+
 def generate_output_filename(city, theme_name, output_format):
     """
     Generate unique output filename with city, theme, and datetime.
@@ -691,7 +708,7 @@ def buildings_allowed(area_km2: float, cap_km2: float = 200.0) -> bool:
     return area_km2 <= cap_km2
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, draw_buildings=False, progress_callback=None):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, dpi=300, brand=None, coastline=False, borders_level=None, glaciers=False, terrain=False, bbox=None, road_detail="auto", draw_water=True, draw_parks=True, draw_roads=True, draw_buildings=False, title_font=None, progress_callback=None):
     print(f"\nGenerating map for {city}, {country}...")
 
     # When bbox is provided, expand to cover the aspect-ratio-adjusted crop area.
@@ -992,23 +1009,14 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     BASE_TOP = 40
     BASE_SUB = 22
     BASE_COORDS = 14
-    BASE_ATTR = 8
-    
-    # 4. Typography using Roboto font
-    if FONTS:
-        font_main = FontProperties(fname=FONTS['bold'], size=BASE_MAIN * scale_factor)
-        font_top = FontProperties(fname=FONTS['bold'], size=BASE_TOP * scale_factor)
-        font_sub = FontProperties(fname=FONTS['light'], size=BASE_SUB * scale_factor)
-        font_coords = FontProperties(fname=FONTS['regular'], size=BASE_COORDS * scale_factor)
-        font_attr = FontProperties(fname=FONTS['light'], size=BASE_ATTR * scale_factor)
-    else:
-        # Fallback to system fonts
-        font_main = FontProperties(family='monospace', weight='bold', size=BASE_MAIN * scale_factor)
-        font_top = FontProperties(family='monospace', weight='bold', size=BASE_TOP * scale_factor)
-        font_sub = FontProperties(family='monospace', weight='normal', size=BASE_SUB * scale_factor)
-        font_coords = FontProperties(family='monospace', size=BASE_COORDS * scale_factor)
-        font_attr = FontProperties(family='monospace', size=BASE_ATTR * scale_factor)
-    
+
+    # 4. Typography using the resolved title font (falls back to bundled Roboto)
+    title_fonts = resolve_title_fonts(title_font)
+    font_main = FontProperties(fname=title_fonts['bold'], size=BASE_MAIN * scale_factor)
+    font_top = FontProperties(fname=title_fonts['bold'], size=BASE_TOP * scale_factor)
+    font_sub = FontProperties(fname=title_fonts['light'], size=BASE_SUB * scale_factor)
+    font_coords = FontProperties(fname=title_fonts['regular'], size=BASE_COORDS * scale_factor)
+
     spaced_city = "  ".join(list(city.upper()))
     
     # Dynamically adjust font size based on city name length to prevent truncation
@@ -1023,10 +1031,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     else:
         adjusted_font_size = base_adjusted_main
     
-    if FONTS:
-        font_main_adjusted = FontProperties(fname=FONTS['bold'], size=adjusted_font_size)
-    else:
-        font_main_adjusted = FontProperties(family='monospace', weight='bold', size=adjusted_font_size)
+    font_main_adjusted = FontProperties(fname=title_fonts['bold'], size=adjusted_font_size)
 
     # --- BOTTOM TEXT ---
     ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
@@ -1205,7 +1210,7 @@ Examples:
     parser.add_argument('--no-parks', dest='no_parks', action='store_true', help='Disable park features')
     parser.add_argument('--no-roads', dest='no_roads', action='store_true', help='Disable road features')
     parser.add_argument('--buildings', dest='buildings', action='store_true', help='Enable building footprints (capped at 200km² bbox area)')
-    parser.add_argument('--font', type=str, help='Font ID for poster typography (downloads from Google Fonts if needed)')
+    parser.add_argument('--title-font', dest='title_font', type=str, help='Font ID for poster title typography')
 
     args = parser.parse_args()
     
@@ -1300,7 +1305,7 @@ Examples:
             else:
                 THEME = load_theme(theme_name)
             output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], draw_buildings=args.buildings, progress_callback=progress_cb)
+            create_poster(args.city, country_for_poster, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, dpi=args.dpi, brand=args.brand, coastline=args.coastline, borders_level=args.borders, glaciers=args.glaciers, terrain=args.terrain, bbox=parsed_bbox, road_detail=args.road_detail, draw_water=layers["water"], draw_parks=layers["parks"], draw_roads=layers["roads"], draw_buildings=args.buildings, title_font=args.title_font, progress_callback=progress_cb)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
