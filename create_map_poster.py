@@ -214,6 +214,30 @@ def resolve_title_fonts(title_font_id, fonts_root: str = FONTS_DIR) -> dict:
     return roboto
 
 
+NOTO_TTF_PATHS = {
+    "noto_sans": {
+        "regular": os.path.join(FONTS_DIR, "NotoSans-Regular.ttf"),
+        "bold": os.path.join(FONTS_DIR, "NotoSans-Bold.ttf"),
+        "italic": os.path.join(FONTS_DIR, "NotoSans-Italic.ttf"),
+    },
+    "noto_serif": {
+        "regular": os.path.join(FONTS_DIR, "NotoSerif-Regular.ttf"),
+        "bold": os.path.join(FONTS_DIR, "NotoSerif-Bold.ttf"),
+        "italic": os.path.join(FONTS_DIR, "NotoSerif-Italic.ttf"),
+    },
+}
+
+
+def resolve_label_fonts(label_font_id, fonts_root: str = FONTS_DIR) -> dict:
+    """Return {regular,bold,italic} ttf paths for the label font, default Noto Sans."""
+    chosen = NOTO_TTF_PATHS.get(label_font_id or "noto_sans", NOTO_TTF_PATHS["noto_sans"])
+    resolved = {role: os.path.join(fonts_root, os.path.basename(p)) for role, p in chosen.items()}
+    if all(os.path.exists(p) for p in resolved.values()):
+        return resolved
+    # Fallback to Roboto if a Noto file is missing.
+    return {"regular": ROBOTO_TTF_PATHS["regular"], "bold": ROBOTO_TTF_PATHS["bold"], "italic": ROBOTO_TTF_PATHS["regular"]}
+
+
 def generate_output_filename(city, theme_name, output_format):
     """
     Generate unique output filename with city, theme, and datetime.
