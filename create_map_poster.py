@@ -930,7 +930,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if draw_labels:
             pbar.set_description("Downloading place and water labels")
             places = fetch_features(point, feat_dist, tags={'place': ['country', 'state', 'city', 'town', 'village', 'suburb', 'neighbourhood']}, name='places', bbox=fetch_bbox)
-            water_names = fetch_features(point, feat_dist, tags={'natural': 'water', 'name': True}, name='water_names', bbox=fetch_bbox)
+            water_names = fetch_features(point, feat_dist, tags={'natural': 'water'}, name='water_names', bbox=fetch_bbox)
         pbar.update(1)
         report_progress("fetchingLabels")
 
