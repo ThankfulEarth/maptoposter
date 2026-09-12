@@ -385,3 +385,24 @@ class TestTagCoverage:
         assert "highway" in self.LINEAR_TAG_KEYS
 
 
+
+
+class TestOfflineDependenciesDeclared:
+    """Offline deps must be in requirements.txt, not just the dev venv.
+
+    osm_reader imports osmium lazily, inside the offline code path, so a
+    missing declaration surfaces only at runtime under OSM_OFFLINE=true.
+    The Docker image installs requirements.txt and nothing else (the apt
+    osmium-tool package is the CLI used by osm_cache, not this binding).
+    """
+
+    def test_osmium_is_declared(self):
+        requirements = (
+            Path(__file__).parent.parent / "requirements.txt"
+        ).read_text()
+        declared = {
+            line.split("==")[0].split(">=")[0].strip()
+            for line in requirements.splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        assert "osmium" in declared
